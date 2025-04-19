@@ -78,6 +78,98 @@ metric_config:
 
 通过上面的设计可以看出，非时序存储的Block只有两个，任何时间点的指标查询只会去查询两个block，这个io开销是很小的。同时block的结构仍然保持跟原有的prometheus一致，这样改动也是非常的低。
 
+## 查询逻辑
+第一个改造跟上面的那个是一样的，就是查询的时候根据指标配置来判断是否是「非易变指标」，如果是的话，则切换到「非时序存储」的block上进行查询
+
+
+
+```go
+func (ng *Engine) populateSeries(ctx context.Context, querier storage.Querier, s *parser.EvalStmt) {
+    // Whenever a MatrixSelector is evaluated, evalRange is set to the corresponding range.
+    // The evaluation of the VectorSelector inside then evaluates the given range and unsets
+    // the variable.
+    var evalRange time.Duration
+
+    parser.Inspect(s.Expr, func(node parser.Node, path []parser.Node) error {
+        switch n := node.(type) {
+            case *parser.VectorSelector:
+            start, end := getTimeRangesForSelector(s, n, path, evalRange)
+            interval := ng.getLastSubqueryInterval(path)
+            if interval == 0 {
+                interval = s.Interval
+            }
+            hints := &storage.SelectHints{
+                Start: start,
+                End:   end,
+                Step:  durationMilliseconds(interval),
+                Range: durationMilliseconds(evalRange),
+                Func:  extractFuncFromPath(path),
+            }
+            evalRange = 0
+            hints.By, hints.Grouping = extractGroupsFromPath(path)
+            n.UnexpandedSeriesSet = querier.Select(ctx, false, hints, n.LabelMatchers...)
+
+            case *parser.MatrixSelector:
+            evalRange = n.Range
+        }
+        return nil
+    })
+```
+
+也就是在24行的querier.Select的时候进行BlockReader的切换。
+
+
+
+第二个改造就是涉及到核心的查询逻辑的更改，原先的查询逻辑大体如下
+
+![画板](1744960921575-b0818120-0115-4a34-aa61-26114286e15b.jpeg)
+
+打个比方这里有三个sample，就是那三个白点。这个时候promql来查询t0时刻指标的值，prometheus不会只是真的去查询t0这个时刻的点，而是向后搜寻lookbackDelta（默认是5）分钟，找到第一个符合要求的点。
+
+
+
+对应到实现来说ChunckSeries的迭代器都实现了
+
+```go
+type Iterator interface {
+	// Next advances the iterator by one and returns the type of the value
+	// at the new position (or ValNone if the iterator is exhausted).
+	Next() ValueType
+	// Seek advances the iterator forward to the first sample with a
+	// timestamp equal or greater than t. If the current sample found by a
+	// previous `Next` or `Seek` operation already has this property, Seek
+	// has no effect. If a sample has been found, Seek returns the type of
+	// its value. Otherwise, it returns ValNone, after which the iterator is
+	// exhausted.
+	Seek(t int64) ValueType
+```
+
+通过Seek方法能够找到第一个大于t0的点，这个例子里面是没有的所以就是chunkenc.ValNone
+
+
+
+第二步判断
+
+```go
+	if valueType == chunkenc.ValNone || t > refTime {
+		var ok bool
+		t, v, h, ok = it.PeekPrev()
+		if !ok || t <= refTime-durationMilliseconds(ev.lookbackDelta) {
+			return 0, 0, nil, false
+		}
+	}
+```
+it.PeekPrev()就是取上一个点的意思，chunkenc.ValNone的上一个点就是v3，如果t0 - 5m的时间戳是大于等于v3的话则返回nil，我们这个例子里面显然是不成立的，可以直接返回v3。
+
+
+
+回到我们「非易变指标」查询逻辑上，lookbackDelta参数是肯定不需要的，我们仅仅需要找到最近的小于t0的点即可。
+
+![画板](1744961223779-958adfac-4aec-4069-a774-11ff4aec95a9.jpeg)
+
+回到程序实现上，原先的两步判断直接变成一步判断即可，就是第一步调用iterator.Seek()找到第一个大于t0的sample，然后返回它的上一个点it.PeekPrev()即可。
+
+
 
 
 同时这里「非易变指标」本身就是变动较小的指标，即便储存最近的100个数据，存储的时间跨度也是非常的大，这样在存储成本和查询效率等各个方面都是大大的飞跃。
